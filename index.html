@@ -14,6 +14,10 @@
       window.addEventListener('load',()=>navigator.serviceWorker.register('./sw.js').catch(()=>{}));
     }
   </script>
+  <!-- Firebase (real-time sync between Erika & David) -->
+  <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore-compat.js"></script>
   <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet"/>
   <style>
     :root {
@@ -659,6 +663,11 @@
     <div class="page-header"><div class="page-title">⚙️ Settings</div></div>
     <div style="padding:0 16px;">
       <div class="ssec">
+        <div class="ssec-title">🔄 Live Sync</div>
+        <div id="sync-status" style="font-size:14px;font-weight:600;color:var(--text3);">🐾 Connecting…</div>
+        <div class="s-hint">Pawgress now syncs between you and David in real time. Tick a habit on one phone and it appears on the other within a second — same for rewards and measurements.</div>
+      </div>
+      <div class="ssec">
         <div class="ssec-title">📅 Challenge Start Date</div>
         <label class="s-lbl">Set your challenge start date</label>
         <input type="date" id="start-date-input" class="s-input" onchange="saveStartDate()"/>
@@ -783,7 +792,88 @@ function loadState(){
   if(!state.purchases) state.purchases={};
   if(!state.spent) state.spent={};
 }
-function saveState(){localStorage.setItem('pawgress',JSON.stringify(state));}
+function saveState(overwrite){
+  localStorage.setItem('pawgress',JSON.stringify(state));
+  pushToCloud(!!overwrite);
+}
+
+// ══════════════════════════════════
+// FIREBASE SYNC  (shared board — both phones see the same data live)
+// ══════════════════════════════════
+const firebaseConfig = {
+  apiKey: "AIzaSyBG0fDMmF4Hp7Xa4mxJX1UzjUrfeqKFk9M",
+  authDomain: "pawgress-37e03.firebaseapp.com",
+  projectId: "pawgress-37e03",
+  storageBucket: "pawgress-37e03.firebasestorage.app",
+  messagingSenderId: "1021490021033",
+  appId: "1:1021490021033:web:b47f88ed1776dea4b41fb8"
+};
+// Fields that sync between devices. notifsEnabled stays per-device on purpose.
+const SYNC_FIELDS=['startDate','checks','measurements','purchases','spent'];
+let db=null, docRef=null, syncReady=false, lastSyncStatus='connecting';
+
+function setSyncStatus(s){
+  lastSyncStatus=s;
+  const el=document.getElementById('sync-status');
+  if(!el)return;
+  const map={
+    connecting:['var(--text3)','🐾 Connecting…'],
+    synced:['var(--sage)','✅ Synced — you & David are live'],
+    saving:['var(--amber)','🦴 Saving…'],
+    offline:['var(--rose)','⚠️ Offline — saved on this device only']
+  };
+  const v=map[s]||map.offline;
+  el.style.color=v[0]; el.textContent=v[1];
+}
+
+function startSync(){
+  try{
+    if(!window.firebase||!firebase.firestore){setSyncStatus('offline');return;}
+    if(!firebase.apps.length) firebase.initializeApp(firebaseConfig);
+    db=firebase.firestore();
+    docRef=db.collection('pawgress').doc('shared');
+    setSyncStatus('connecting');
+    firebase.auth().signInAnonymously().then(()=>{
+      docRef.onSnapshot(snap=>{
+        if(snap.exists){
+          const d=snap.data();
+          SYNC_FIELDS.forEach(f=>{ if(d[f]!==undefined) state[f]=d[f]; });
+          if(!state.checks)state.checks={};
+          if(!state.measurements)state.measurements={};
+          if(!state.purchases)state.purchases={};
+          if(!state.spent)state.spent={};
+          localStorage.setItem('pawgress',JSON.stringify(state));
+          syncReady=true;
+          currentWeek=currentWeekIdx();
+          render();
+          setSyncStatus('synced');
+        } else {
+          // No shared doc yet — seed it from this device.
+          syncReady=true;
+          pushToCloud(true);
+        }
+      }, err=>{ console.warn('Pawgress sync error:',err); setSyncStatus('offline'); });
+    }).catch(err=>{ console.warn('Pawgress auth error:',err); setSyncStatus('offline'); });
+  }catch(e){ console.warn(e); setSyncStatus('offline'); }
+}
+
+function pushToCloud(overwrite){
+  if(!docRef||!syncReady)return;
+  const payload={
+    startDate: state.startDate,
+    checks: state.checks||{},
+    measurements: state.measurements||{},
+    purchases: state.purchases||{},
+    spent: state.spent||{}
+  };
+  setSyncStatus('saving');
+  // merge:true lets simultaneous edits (different days/people) coexist instead of clobbering.
+  // overwrite (merge:false) is used by the Reset buttons so cleared data actually clears.
+  docRef.set(payload,{merge:!overwrite})
+    .then(()=>setSyncStatus('synced'))
+    .catch(err=>{ console.warn('Pawgress save error:',err); setSyncStatus('offline'); });
+}
+
 function fmt(d){return d.toISOString().split('T')[0];}
 function parseD(s){const[y,m,d]=s.split('-').map(Number);return new Date(y,m-1,d);}
 function addD(d,n){const r=new Date(d);r.setDate(r.getDate()+n);return r;}
@@ -893,7 +983,7 @@ function deleteMeasurement(person,idx){
   saveState();renderBody();
 }
 function resetMeasurements(){
-  state.measurements={};saveState();renderBody();toast('Measurements cleared 📏');
+  state.measurements={};saveState(true);renderBody();toast('Measurements cleared 📏');
 }
 
 // ══════════════════════════════════
@@ -1367,14 +1457,17 @@ function renderBody(){
 function renderSettings(){
   document.getElementById('start-date-input').value=state.startDate||'';
   updateNotifUI();
+  setSyncStatus(lastSyncStatus);
 }
 function saveStartDate(){
   const v=document.getElementById('start-date-input').value;
   if(v){state.startDate=v;saveState();currentWeek=currentWeekIdx();render();toast('Start date saved! 🐾');}
 }
 function resetData(){
-  state={startDate:state.startDate,checks:{},notifsEnabled:state.notifsEnabled,measurements:state.measurements};
-  saveState();render();toast('Habit data cleared 🦴');
+  state.checks={};
+  state.purchases={};
+  state.spent={};
+  saveState(true);render();toast('Habit data cleared 🦴');
 }
 
 // ══════════════════════════════════
@@ -1550,6 +1643,7 @@ loadState();
 currentWeek=currentWeekIdx();
 initQuote();
 render();
+startSync();
 if(state.notifsEnabled){scheduleNotifications();scheduleWeeklySummary();}
 </script>
 </body>
